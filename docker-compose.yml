@@ -1,0 +1,68 @@
+services:
+  pr_db:
+    image: postgres:17-bookworm
+    restart: unless-stopped
+    ports:
+      - "5434:5432"
+    networks:
+      - db_network
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_USER: ${POSTGRES_USER:-postgresuser}
+      POSTGRES_DB: "product_rank_db"
+
+  pr_django:
+    container_name: pr_django
+    restart: always
+    build:
+      context: django
+      dockerfile: Dockerfile
+    ports:
+      - "5005:5005"
+    networks:
+      - db_network
+      - web_network
+    volumes:
+      - "shared_static:/usr/src/app/src/staticfiles"
+    depends_on:
+      - pr_db
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-product_rank_db}
+      POSTGRES_USER: ${POSTGRES_USER:-postgresuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY}
+      DJANGO_DEBUG: ${DJANGO_DEBUG:-False}
+      DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1,0.0.0.0}
+      DJANGO_CSRF_TRUSTED_ORIGINS: ${DJANGO_CSRF_TRUSTED_ORIGINS:-http://localhost:8000,http://127.0.0.1:8000}
+
+  pr_nginx:
+    container_name: pr_nginx
+    restart: always
+    build:
+      context: reverse-proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - web_network
+    depends_on:
+      - pr_django
+    volumes:
+      - ".certs/localhost.pem:/rootCA.pem:ro"
+      - ".certs/localhost.crt:/fullchain.crt:ro"
+      - ".certs/localhost.key:/privkey.key:ro"
+      - "shared_static:/usr/share/nginx/html/dist"
+    environment:
+      - PUBLIC_DOMAIN=${PUBLIC_DOMAIN:-localhost}
+
+networks:
+  db_network:
+    driver: bridge
+  web_network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  shared_static:

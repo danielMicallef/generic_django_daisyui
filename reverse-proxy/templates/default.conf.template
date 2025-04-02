@@ -1,0 +1,127 @@
+upstream pr_django {
+    server pr_django:5005;
+}
+
+# Compression
+gzip_disable        "msie6";
+gzip_proxied        any;
+gzip_comp_level     6;
+gzip_buffers        16 8k;
+gzip_http_version   1.1;
+gzip_min_length     0;
+gzip_types          text/plain
+                    application/javascript
+                    text/css
+                    application/json
+                    application/x-javascript
+                    text/xml
+                    application/xml
+                    application/xml+rss
+                    text/javascript
+                    application/vnd.ms-fontobject
+                    application/x-font-ttf
+                    font/opentype;
+
+# HSTS
+# (Adding the following header to the server response will ensure all future connections enforce HTTPS)
+add_header Strict-Transport-Security "max-age=31536000; includeSubdomains";
+
+# Protect against Clickjacking
+# (This will prevent all external domains from embedding your site directly into their own through the use of the iframe tag)
+add_header X-Frame-Options "SAMEORIGIN" always;
+
+# Protect against MIME Sniffing
+add_header X-Content-Type-Options "nosniff" always;
+
+# Protect against XSS
+add_header X-XSS-Protection "1; mode=block" always;
+
+server {
+    listen          80;
+    listen          [::]:80;
+    server_name     ${PUBLIC_DOMAIN};
+
+    return 301 https://${PUBLIC_DOMAIN}$request_uri;
+}
+
+server {
+    listen              443 ssl default_server;
+    listen              [::]:443 ssl default_server;
+    server_name         ${PUBLIC_DOMAIN};
+    http2 on;
+
+    # Disables emitting nginx version in error messages and in the "Server" response header field.
+    server_tokens   off;
+
+    # SSL
+    ssl_certificate     /etc/nginx/ssl/${PUBLIC_DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/nginx/ssl/${PUBLIC_DOMAIN}/privkey.pem;
+    include             /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam         /etc/letsencrypt/ssl-dhparams.pem;
+
+    # OCSP stapling
+    ssl_stapling            on;
+    ssl_stapling_verify     on;
+
+    # Verify chain of trust of OCSP response using Root CA and Intermediate certs
+    ssl_trusted_certificate /etc/nginx/ssl/${PUBLIC_DOMAIN}/chain.pem;
+
+    # Disabled caching
+    expires     0;
+    add_header  Cache-Control private;
+
+    # Set useful headers
+    proxy_set_header        Host $host;
+    proxy_set_header        X-Real-IP $remote_addr;
+    proxy_set_header        X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header        X-Forwarded-Host $http_host;
+    proxy_set_header        X-Forwarded-Proto $scheme;
+
+    # WebSocket support
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+
+    # Increase buffer to fix the 502 Keycloak error while authenticating, due to the big response header.
+    proxy_buffer_size         256k;
+    proxy_buffers             4 256k;
+    proxy_busy_buffers_size   256k;
+
+    # Root folder
+    root    /usr/share/nginx/html;
+
+    location /static {
+        alias /usr/share/nginx/html/;
+        index index.html index.htm;
+        include /etc/nginx/mime.types;
+        default_type application/octet-stream;
+
+        # Add explicit types for critical assets if needed
+        types {
+            text/css css;
+            application/javascript js;
+        }
+        try_files $uri $uri/ /index.html;
+        expires 7d;
+        add_header Cache-Control "public, max-age=604800";
+    }
+
+    # Backend
+    location / {
+        gzip                on;
+        gzip_vary           on;
+        proxy_pass          http://pr_django;
+        proxy_set_header    X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header    X-Real-IP $remote_addr;
+        proxy_set_header    X-Forwarded-Proto $scheme;
+        proxy_set_header    Host $host;
+    }
+
+    # Fix redirect error (The plain HTTP request was sent to HTTPS port) from HTTP
+    error_page 497 https://$http_host$request_uri;
+
+    error_page   500 502 503 504  /50x.html;
+    location = /50x.html {
+        root   /usr/share/nginx/html;
+    }
+}

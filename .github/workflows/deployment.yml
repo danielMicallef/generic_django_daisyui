@@ -1,0 +1,146 @@
+name: Deployment
+
+on:
+  workflow_call:
+    inputs:
+      target-env:
+        description: "Environment to deploy to"
+        required: false
+        type: string
+        default: "production"
+
+  workflow_dispatch:
+    inputs:
+      target-env:
+        description: "Environment to deploy to"
+        required: false
+        type: string
+        default: "production"
+
+env:
+  POSTGRES_DB: "product_rank_db"
+  HETZNER_REMOTE_USER: "ubuntu"
+
+jobs:
+  deploy:
+    name: Deploying to ${{ inputs.target-env }}
+    runs-on: self-hosted
+    environment:
+      name: ${{ inputs.target-env }}
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v3
+      #
+      #      - name: install software
+      #        run: |
+      #          apt update -y && apt install zip
+
+      - name: inject .env file
+        run: |
+          echo "${{ secrets.ENV_FILE }}" > .env
+
+      - name: Construct docker-compose for production environment
+        if: inputs.target-env == 'production'
+        shell: bash {0}
+        run: |
+          version=$(grep -E '^\s*version\s*=\s*".*"' django/pyproject.toml | awk -F'"' '{print $2}')
+
+          sed -e "s/{{ prod_version }}/${version}/g" \
+              docker-compose.prod.yml > docker-compose.yml
+
+      - name: Generate Deployment Package
+        run: zip -r prod_rank.zip docker-compose.yml .env django reverse-proxy
+
+      - name: Get short SHA
+        id: slug
+        run: echo "::set-output name=sha7::$(echo ${GITHUB_SHA} | cut -c1-7)"
+
+      - name: Copy package into production server
+        shell: bash {0}
+        run: |
+          echo "${{ secrets.HETZNER_PRIVATE_KEY }}" > private_key
+          chmod 600 private_key
+          scp -i private_key -o StrictHostKeyChecking=no prod_rank.zip ${HETZNER_REMOTE_USER}@${{ vars.HETZNER_REMOTE_HOST }}:/tmp/
+
+      - name: Create certificates
+        if: inputs.target-env == 'certify'
+        shell: bash {0}
+        run: |
+          ssh -o StrictHostKeyChecking=no -i private_key ${HETZNER_REMOTE_USER}@${{ vars.HETZNER_REMOTE_HOST }} '
+              echo "${{ secrets.HETZNER_PRIVATE_KEY }}" > private_key
+              echo "Copied private key"
+              ls -la
+              chmod 600 private_key
+              echo "ubuntu ALL=(ALL) NOPASSWD: /usr/bin/certbot, /bin/cp -L /etc/letsencrypt/*, /bin/chown -R * /home/ubuntu/.certs" | sudo tee /etc/sudoers.d/ubuntu-certbot
+              sudo chmod 440 /etc/sudoers.d/ubuntu-certbot
+
+              APP_FOLDER="/home/ubuntu/product-rank"
+              DOMAIN=${{ vars.PUBLIC_DOMAIN }}
+              mkdir -p .certs/${DOMAIN}
+
+              # Install certbot if not already installed
+              if ! command -v certbot &> /dev/null; then
+                sudo apt-get update
+                sudo apt-get install -y certbot python3-certbot-nginx
+              fi
+              echo "Generating SSL Certificates"
+              # Generate SSL certificate if it does not exist or is expired
+              if [ ! -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ] || \
+                 [ $(date +%s) -gt $(date -d "$(openssl x509 -enddate -noout -in /etc/letsencrypt/live/${DOMAIN}/fullchain.pem | cut -d= -f2)" +%s) ]; then
+                sudo certbot certonly --standalone \
+                  --non-interactive \
+                  --agree-tos \
+                  --email "${{ vars.CERTBOT_EMAIL }}" \
+                  --domain ${DOMAIN}
+              fi
+              echo "SSL certificates generated."
+              sudo ls /etc/letsencrypt/live/${DOMAIN}/
+              sudo cp -L /etc/letsencrypt/live/${DOMAIN}/cert.pem .certs/${DOMAIN}/cert.pem
+              sudo cp -L /etc/letsencrypt/live/${DOMAIN}/chain.pem .certs/${DOMAIN}/chain.pem
+              sudo cp -L /etc/letsencrypt/live/${DOMAIN}/fullchain.pem .certs/${DOMAIN}/fullchain.pem
+              sudo cp -L /etc/letsencrypt/live/${DOMAIN}/privkey.pem .certs/${DOMAIN}/privkey.pem
+
+              # Set proper permissions for certificates
+              sudo chown -R ${USER}:${USER} .certs
+              sudo chmod 600 .certs/${DOMAIN}/*
+            '
+
+      - name: Deploy to production environment
+        if: inputs.target-env == 'production'
+        shell: bash {0}
+        run: |
+          ssh -o StrictHostKeyChecking=no -i private_key ${HETZNER_REMOTE_USER}@${{ vars.HETZNER_REMOTE_HOST }} '
+
+              APP_FOLDER="/home/ubuntu/product-rank"
+              DOMAIN=${{ vars.PUBLIC_DOMAIN }}
+
+              mkdir -p ${APP_FOLDER}
+              mv /tmp/prod_rank.zip ${APP_FOLDER}/ && cd ${APP_FOLDER}
+
+              if [ -f docker-compose.yml ]; then
+                docker compose down
+                sleep 10
+                mv docker-compose.yml docker-compose.yml.bak
+                mv .env .env.bak
+                docker image prune -a -f
+              fi
+
+              unzip -o prod_rank.zip && ls -la
+              docker compose up --build -d
+              sleep 30
+
+              echo "verify services are up & running..."
+
+              # Check if all required containers are running
+              if ! docker compose ps pr_django pr_db pr_nginx | grep -q "Up"; then
+                echo "deployment is not successful - some containers are not running..."
+                docker compose ps
+                exit 1
+              fi
+
+              echo "deployment successful - all containers are up and running..."
+           '
+
+          #remove private key
+          rm private_key
